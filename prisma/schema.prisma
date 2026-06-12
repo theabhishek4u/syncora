@@ -1,0 +1,122 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  rooms         RoomMember[]
+  playlists     Playlist[]
+  history       ListeningHistory[]
+  hostedRooms   Room[]     @relation("RoomHost")
+}
+
+model Room {
+  id            String    @id @default(cuid())
+  code          String    @unique @default(cuid())
+  name          String
+  description   String?
+  type          String    @default("private") // private, friends, solo
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  hostId        String
+  host          User      @relation("RoomHost", fields: [hostId], references: [id])
+
+  members       RoomMember[]
+  queue         QueueItem[]
+}
+
+model RoomMember {
+  id            String    @id @default(cuid())
+  userId        String
+  roomId        String
+  role          String    @default("listener") // host, cohost, listener
+  isMuted       Boolean   @default(false)
+  joinedAt      DateTime  @default(now())
+  leftAt        DateTime?
+
+  user          User      @relation(fields: [userId], references: [id])
+  room          Room      @relation(fields: [roomId], references: [id])
+
+  @@unique([userId, roomId])
+}
+
+model Song {
+  id            String    @id @default(cuid())
+  title         String
+  artist        String
+  album         String?
+  duration      Int       // in seconds
+  coverUrl      String?
+  audioUrl      String?
+  createdAt     DateTime  @default(now())
+
+  queueItems    QueueItem[]
+  history       ListeningHistory[]
+  playlistItems PlaylistSong[]
+}
+
+model QueueItem {
+  id            String    @id @default(cuid())
+  roomId        String
+  songId        String
+  position      Int       // order in queue
+  addedBy       String
+  addedAt       DateTime  @default(now())
+
+  room          Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  song          Song      @relation(fields: [songId], references: [id])
+
+  @@unique([roomId, position])
+}
+
+model Playlist {
+  id            String    @id @default(cuid())
+  name          String
+  description   String?
+  isPublic      Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+
+  songs         PlaylistSong[]
+}
+
+model PlaylistSong {
+  id            String    @id @default(cuid())
+  playlistId    String
+  songId        String
+  position      Int
+  addedAt       DateTime  @default(now())
+
+  playlist      Playlist  @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  song          Song      @relation(fields: [songId], references: [id])
+
+  @@unique([playlistId, songId])
+}
+
+model ListeningHistory {
+  id            String    @id @default(cuid())
+  userId        String
+  songId        String
+  roomId        String?
+  playedAt      DateTime  @default(now())
+  duration      Int       // how long they listened in seconds
+
+  user          User      @relation(fields: [userId], references: [id])
+  song          Song      @relation(fields: [songId], references: [id])
+}

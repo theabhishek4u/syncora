@@ -1,0 +1,960 @@
+     1→import { createServer } from 'http'
+     2→import { Server, Socket } from 'socket.io'
+     3→
+     4→// ============================================================
+     5→// Type Definitions
+     6→// ============================================================
+     7→
+     8→interface SongData {
+     9→  id: string
+    10→  title: string
+    11→  artist: string
+    12→  album?: string
+    13→  duration: number
+    14→  coverUrl?: string
+    15→  audioUrl?: string
+    16→}
+    17→
+    18→interface MemberState {
+    19→  socketId: string
+    20→  userId: string
+    21→  userName: string
+    22→  userImage?: string
+    23→  joinedAt: number
+    24→  isMuted: boolean
+    25→}
+    26→
+    27→interface PlaybackState {
+    28→  isPlaying: boolean
+    29→  currentSong: SongData | null
+    30→  position: number // in milliseconds
+    31→  lastSyncTime: number // timestamp of last sync
+    32→  startedAt: number // when playback started (for sync calculation)
+    33→}
+    34→
+    35→interface QueueItem {
+    36→  song: SongData
+    37→  addedBy: string
+    38→  addedAt: number
+    39→}
+    40→
+    41→interface RoomState {
+    42→  id: string
+    43→  name: string
+    44→  hostId: string
+    45→  members: Map<string, MemberState>
+    46→  playback: PlaybackState
+    47→  queue: QueueItem[]
+    48→  voiceMembers: Set<string>
+    49→}
+    50→
+    51→// ============================================================
+    52→// Room & Socket Tracking
+    53→// ============================================================
+    54→
+    55→const rooms = new Map<string, RoomState>()
+    56→const socketToRoom = new Map<string, string>() // socketId -> roomId
+    57→const socketToUser = new Map<string, string>() // socketId -> userId
+    58→
+    59→function getOrCreateRoom(roomId: string, roomName: string, hostId: string): RoomState {
+    60→  if (!rooms.has(roomId)) {
+    61→    rooms.set(roomId, {
+    62→      id: roomId,
+    63→      name: roomName,
+    64→      hostId,
+    65→      members: new Map(),
+    66→      playback: {
+    67→        isPlaying: false,
+    68→        currentSong: null,
+    69→        position: 0,
+    70→        lastSyncTime: 0,
+    71→        startedAt: 0,
+    72→      },
+    73→      queue: [],
+    74→      voiceMembers: new Set(),
+    75→    })
+    76→  }
+    77→  return rooms.get(roomId)!
+    78→}
+    79→
+    80→function getRoomForSocket(socket: Socket): RoomState | null {
+    81→  const roomId = socketToRoom.get(socket.id)
+    82→  if (!roomId) return null
+    83→  return rooms.get(roomId) ?? null
+    84→}
+    85→
+    86→function removeMemberFromRoom(socket: Socket): { roomId: string; userId: string; userName: string } | null {
+    87→  const roomId = socketToRoom.get(socket.id)
+    88→  const userId = socketToUser.get(socket.id)
+    89→  if (!roomId || !userId) return null
+    90→
+    91→  const room = rooms.get(roomId)
+    92→  if (!room) return null
+    93→
+    94→  const member = room.members.get(userId)
+    95→  const userName = member?.userName ?? 'Unknown'
+    96→
+    97→  room.members.delete(userId)
+    98→  room.voiceMembers.delete(userId)
+    99→  socketToRoom.delete(socket.id)
+   100→  socketToUser.delete(socket.id)
+   101→
+   102→  // If room is empty, clean it up
+   103→  if (room.members.size === 0) {
+   104→    rooms.delete(roomId)
+   105→    console.log(`Room ${roomId} deleted (empty)`)
+   106→  } else {
+   107→    // If the host left, assign a new host (earliest member)
+   108→    if (room.hostId === userId) {
+   109→      const earliestMember = Array.from(room.members.values()).sort(
+   110→        (a, b) => a.joinedAt - b.joinedAt
+   111→      )[0]
+   112→      if (earliestMember) {
+   113→        room.hostId = earliestMember.userId
+   114→        // Notify room about host change
+   115→        io.to(roomId).emit('room:host-change', {
+   116→          roomId,
+   117→          newHostId: earliestMember.userId,
+   118→          newHostName: earliestMember.userName,
+   119→        })
+   120→        console.log(`Host transferred to ${earliestMember.userName} in room ${roomId}`)
+   121→      }
+   122→    }
+   123→  }
+   124→
+   125→  return { roomId, userId, userName }
+   126→}
+   127→
+   128→function serializeRoom(room: RoomState) {
+   129→  return {
+   130→    id: room.id,
+   131→    name: room.name,
+   132→    hostId: room.hostId,
+   133→    members: Array.from(room.members.values()).map((m) => ({
+   134→      userId: m.userId,
+   135→      userName: m.userName,
+   136→      userImage: m.userImage,
+   137→      joinedAt: m.joinedAt,
+   138→      isMuted: m.isMuted,
+   139→    })),
+   140→    playback: {
+   141→      isPlaying: room.playback.isPlaying,
+   142→      currentSong: room.playback.currentSong,
+   143→      position: room.playback.position,
+   144→      lastSyncTime: room.playback.lastSyncTime,
+   145→      startedAt: room.playback.startedAt,
+   146→    },
+   147→    queue: room.queue,
+   148→    voiceMembers: Array.from(room.voiceMembers),
+   149→  }
+   150→}
+   151→
+   152→function calculateCurrentPosition(room: RoomState): number {
+   153→  if (!room.playback.isPlaying || room.playback.startedAt === 0) {
+   154→    return room.playback.position
+   155→  }
+   156→  const elapsed = Date.now() - room.playback.startedAt
+   157→  return room.playback.position + elapsed
+   158→}
+   159→
+   160→// ============================================================
+   161→// HTTP & Socket.io Server Setup
+   162→// ============================================================
+   163→
+   164→const httpServer = createServer()
+   165→const io = new Server(httpServer, {
+   166→  path: '/',
+   167→  cors: {
+   168→    origin: '*',
+   169→    methods: ['GET', 'POST'],
+   170→  },
+   171→  pingTimeout: 60000,
+   172→  pingInterval: 25000,
+   173→  connectTimeout: 45000,
+   174→})
+   175→
+   176→// ============================================================
+   177→// Connection Handler
+   178→// ============================================================
+   179→
+   180→io.on('connection', (socket: Socket) => {
+   181→  console.log(`[CONNECT] Socket ${socket.id} connected`)
+   182→
+   183→  // ----------------------------------------------------------
+   184→  // Room Management
+   185→  // ----------------------------------------------------------
+   186→
+   187→  socket.on('room:join', (data: { roomId: string; roomName?: string; userId: string; userName: string; userImage?: string }) => {
+   188→    try {
+   189→      const { roomId, roomName, userId, userName, userImage } = data
+   190→
+   191→      if (!roomId || !userId || !userName) {
+   192→        socket.emit('error', { message: 'Missing required fields: roomId, userId, userName' })
+   193→        return
+   194→      }
+   195→
+   196→      // Leave previous room if in one
+   197→      const prevRoomId = socketToRoom.get(socket.id)
+   198→      if (prevRoomId) {
+   199→        const leaveInfo = removeMemberFromRoom(socket)
+   200→        if (leaveInfo) {
+   201→          socket.leave(prevRoomId)
+   202→          io.to(prevRoomId).emit('room:member-left', {
+   203→            roomId: prevRoomId,
+   204→            userId: leaveInfo.userId,
+   205→            userName: leaveInfo.userName,
+   206→          })
+   207→          const prevRoom = rooms.get(prevRoomId)
+   208→          if (prevRoom) {
+   209→            io.to(prevRoomId).emit('room:update', serializeRoom(prevRoom))
+   210→          }
+   211→        }
+   212→      }
+   213→
+   214→      // Get or create room
+   215→      const room = getOrCreateRoom(roomId, roomName ?? `Room ${roomId}`, userId)
+   216→
+   217→      // Add member to room
+   218→      const member: MemberState = {
+   219→        socketId: socket.id,
+   220→        userId,
+   221→        userName,
+   222→        userImage,
+   223→        joinedAt: Date.now(),
+   224→        isMuted: false,
+   225→      }
+   226→      room.members.set(userId, member)
+   227→
+   228→      // Track socket
+   229→      socketToRoom.set(socket.id, roomId)
+   230→      socketToUser.set(socket.id, userId)
+   231→
+   232→      // Join socket.io room
+   233→      socket.join(roomId)
+   234→
+   235→      // Send current room state to the joining user
+   236→      socket.emit('room:joined', {
+   237→        room: serializeRoom(room),
+   238→        currentPosition: calculateCurrentPosition(room),
+   239→      })
+   240→
+   241→      // Notify others in the room
+   242→      socket.to(roomId).emit('room:member-joined', {
+   243→        roomId,
+   244→        member: {
+   245→          userId,
+   246→          userName,
+   247→          userImage,
+   248→          joinedAt: member.joinedAt,
+   249→          isMuted: member.isMuted,
+   250→        },
+   251→      })
+   252→
+   253→      // Broadcast updated room state
+   254→      io.to(roomId).emit('room:update', serializeRoom(room))
+   255→
+   256→      console.log(`[ROOM:JOIN] ${userName} (${userId}) joined room ${roomId}. Members: ${room.members.size}`)
+   257→    } catch (error) {
+   258→      console.error('[ROOM:JOIN] Error:', error)
+   259→      socket.emit('error', { message: 'Failed to join room' })
+   260→    }
+   261→  })
+   262→
+   263→  socket.on('room:leave', (data: { roomId: string; userId: string }) => {
+   264→    try {
+   265→      const { roomId, userId } = data
+   266→      const currentRoomId = socketToRoom.get(socket.id)
+   267→
+   268→      if (currentRoomId !== roomId) {
+   269→        socket.emit('error', { message: 'You are not in this room' })
+   270→        return
+   271→      }
+   272→
+   273→      socket.leave(roomId)
+   274→      const leaveInfo = removeMemberFromRoom(socket)
+   275→
+   276→      if (leaveInfo) {
+   277→        io.to(roomId).emit('room:member-left', {
+   278→          roomId,
+   279→          userId: leaveInfo.userId,
+   280→          userName: leaveInfo.userName,
+   281→        })
+   282→        const room = rooms.get(roomId)
+   283→        if (room) {
+   284→          io.to(roomId).emit('room:update', serializeRoom(room))
+   285→        }
+   286→      }
+   287→
+   288→      socket.emit('room:left', { roomId })
+   289→      console.log(`[ROOM:LEAVE] ${userId} left room ${roomId}`)
+   290→    } catch (error) {
+   291→      console.error('[ROOM:LEAVE] Error:', error)
+   292→      socket.emit('error', { message: 'Failed to leave room' })
+   293→    }
+   294→  })
+   295→
+   296→  // ----------------------------------------------------------
+   297→  // Music Sync (THE CORE FEATURE)
+   298→  // ----------------------------------------------------------
+   299→
+   300→  socket.on('music:play', (data: { roomId: string; songId?: string; position?: number; timestamp: number }) => {
+   301→    try {
+   302→      const { roomId, position, timestamp } = data
+   303→      const room = rooms.get(roomId)
+   304→      if (!room) {
+   305→        socket.emit('error', { message: 'Room not found' })
+   306→        return
+   307→      }
+   308→
+   309→      // Only host can control playback (or allow any member for flexibility)
+   310→      const userId = socketToUser.get(socket.id)
+   311→      const member = userId ? room.members.get(userId) : null
+   312→      if (!member) {
+   313→        socket.emit('error', { message: 'You are not a member of this room' })
+   314→        return
+   315→      }
+   316→
+   317→      const currentPosition = position ?? room.playback.position
+   318→      room.playback.isPlaying = true
+   319→      room.playback.position = currentPosition
+   320→      room.playback.startedAt = Date.now()
+   321→      room.playback.lastSyncTime = timestamp
+   322→
+   323→      // Broadcast to all other room members
+   324→      socket.to(roomId).emit('music:play', {
+   325→        roomId,
+   326→        songId: room.playback.currentSong?.id,
+   327→        position: currentPosition,
+   328→        timestamp,
+   329→        startedAt: room.playback.startedAt,
+   330→      })
+   331→
+   332→      console.log(`[MUSIC:PLAY] Room ${roomId} - Position: ${currentPosition}ms`)
+   333→    } catch (error) {
+   334→      console.error('[MUSIC:PLAY] Error:', error)
+   335→      socket.emit('error', { message: 'Failed to play music' })
+   336→    }
+   337→  })
+   338→
+   339→  socket.on('music:pause', (data: { roomId: string; position?: number; timestamp: number }) => {
+   340→    try {
+   341→      const { roomId, position, timestamp } = data
+   342→      const room = rooms.get(roomId)
+   343→      if (!room) {
+   344→        socket.emit('error', { message: 'Room not found' })
+   345→        return
+   346→      }
+   347→
+   348→      const userId = socketToUser.get(socket.id)
+   349→      const member = userId ? room.members.get(userId) : null
+   350→      if (!member) {
+   351→        socket.emit('error', { message: 'You are not a member of this room' })
+   352→        return
+   353→      }
+   354→
+   355→      // Calculate current position at pause time
+   356→      const currentPosition = position ?? calculateCurrentPosition(room)
+   357→      room.playback.isPlaying = false
+   358→      room.playback.position = currentPosition
+   359→      room.playback.startedAt = 0
+   360→      room.playback.lastSyncTime = timestamp
+   361→
+   362→      socket.to(roomId).emit('music:pause', {
+   363→        roomId,
+   364→        position: currentPosition,
+   365→        timestamp,
+   366→      })
+   367→
+   368→      console.log(`[MUSIC:PAUSE] Room ${roomId} - Position: ${currentPosition}ms`)
+   369→    } catch (error) {
+   370→      console.error('[MUSIC:PAUSE] Error:', error)
+   371→      socket.emit('error', { message: 'Failed to pause music' })
+   372→    }
+   373→  })
+   374→
+   375→  socket.on('music:seek', (data: { roomId: string; position: number; timestamp: number }) => {
+   376→    try {
+   377→      const { roomId, position, timestamp } = data
+   378→      const room = rooms.get(roomId)
+   379→      if (!room) {
+   380→        socket.emit('error', { message: 'Room not found' })
+   381→        return
+   382→      }
+   383→
+   384→      const userId = socketToUser.get(socket.id)
+   385→      const member = userId ? room.members.get(userId) : null
+   386→      if (!member) {
+   387→        socket.emit('error', { message: 'You are not a member of this room' })
+   388→        return
+   389→      }
+   390→
+   391→      room.playback.position = position
+   392→      room.playback.lastSyncTime = timestamp
+   393→
+   394→      if (room.playback.isPlaying) {
+   395→        room.playback.startedAt = Date.now()
+   396→      }
+   397→
+   398→      socket.to(roomId).emit('music:seek', {
+   399→        roomId,
+   400→        position,
+   401→        timestamp,
+   402→      })
+   403→
+   404→      console.log(`[MUSIC:SEEK] Room ${roomId} - Position: ${position}ms`)
+   405→    } catch (error) {
+   406→      console.error('[MUSIC:SEEK] Error:', error)
+   407→      socket.emit('error', { message: 'Failed to seek' })
+   408→    }
+   409→  })
+   410→
+   411→  socket.on('music:track-change', (data: { roomId: string; song: SongData; position?: number; timestamp: number }) => {
+   412→    try {
+   413→      const { roomId, song, position = 0, timestamp } = data
+   414→      const room = rooms.get(roomId)
+   415→      if (!room) {
+   416→        socket.emit('error', { message: 'Room not found' })
+   417→        return
+   418→      }
+   419→
+   420→      const userId = socketToUser.get(socket.id)
+   421→      const member = userId ? room.members.get(userId) : null
+   422→      if (!member) {
+   423→        socket.emit('error', { message: 'You are not a member of this room' })
+   424→        return
+   425→      }
+   426→
+   427→      room.playback.currentSong = song
+   428→      room.playback.position = position
+   429→      room.playback.lastSyncTime = timestamp
+   430→
+   431→      if (room.playback.isPlaying) {
+   432→        room.playback.startedAt = Date.now()
+   433→      }
+   434→
+   435→      // Broadcast track change to room
+   436→      io.to(roomId).emit('music:track-change', {
+   437→        roomId,
+   438→        song,
+   439→        position,
+   440→        timestamp,
+   441→        changedBy: userId,
+   442→      })
+   443→
+   444→      console.log(`[MUSIC:TRACK-CHANGE] Room ${roomId} - Now playing: ${song.title} by ${song.artist}`)
+   445→    } catch (error) {
+   446→      console.error('[MUSIC:TRACK-CHANGE] Error:', error)
+   447→      socket.emit('error', { message: 'Failed to change track' })
+   448→    }
+   449→  })
+   450→
+   451→  socket.on('music:sync', (data: { roomId: string; position: number; timestamp: number; isPlaying: boolean }) => {
+   452→    try {
+   453→      const { roomId, position, timestamp, isPlaying } = data
+   454→      const room = rooms.get(roomId)
+   455→      if (!room) {
+   456→        socket.emit('error', { message: 'Room not found' })
+   457→        return
+   458→      }
+   459→
+   460→      // Update server-side playback state
+   461→      room.playback.position = position
+   462→      room.playback.isPlaying = isPlaying
+   463→      room.playback.lastSyncTime = timestamp
+   464→
+   465→      if (isPlaying && room.playback.startedAt === 0) {
+   466→        room.playback.startedAt = Date.now()
+   467→      } else if (!isPlaying) {
+   468→        room.playback.startedAt = 0
+   469→      }
+   470→
+   471→      // Broadcast sync to other room members
+   472→      socket.to(roomId).emit('music:sync', {
+   473→        roomId,
+   474→        position,
+   475→        timestamp,
+   476→        isPlaying,
+   477→        startedAt: room.playback.startedAt,
+   478→      })
+   479→
+   480→      console.log(`[MUSIC:SYNC] Room ${roomId} - Position: ${position}ms, Playing: ${isPlaying}`)
+   481→    } catch (error) {
+   482→      console.error('[MUSIC:SYNC] Error:', error)
+   483→      socket.emit('error', { message: 'Failed to sync music' })
+   484→    }
+   485→  })
+   486→
+   487→  socket.on('music:sync-request', (data: { roomId: string }) => {
+   488→    try {
+   489→      const { roomId } = data
+   490→      const room = rooms.get(roomId)
+   491→      if (!room) {
+   492→        socket.emit('error', { message: 'Room not found' })
+   493→        return
+   494→      }
+   495→
+   496→      const currentPosition = calculateCurrentPosition(room)
+   497→
+   498→      socket.emit('music:sync-response', {
+   499→        roomId,
+   500→        isPlaying: room.playback.isPlaying,
+   501→        currentSong: room.playback.currentSong,
+   502→        position: currentPosition,
+   503→        startedAt: room.playback.startedAt,
+   504→        lastSyncTime: room.playback.lastSyncTime,
+   505→        timestamp: Date.now(),
+   506→      })
+   507→
+   508→      console.log(`[MUSIC:SYNC-REQUEST] Room ${roomId} - Sent sync response (position: ${currentPosition}ms)`)
+   509→    } catch (error) {
+   510→      console.error('[MUSIC:SYNC-REQUEST] Error:', error)
+   511→      socket.emit('error', { message: 'Failed to get sync state' })
+   512→    }
+   513→  })
+   514→
+   515→  // ----------------------------------------------------------
+   516→  // Queue Management
+   517→  // ----------------------------------------------------------
+   518→
+   519→  socket.on('queue:add', (data: { roomId: string; song: SongData; addedBy: string }) => {
+   520→    try {
+   521→      const { roomId, song, addedBy } = data
+   522→      const room = rooms.get(roomId)
+   523→      if (!room) {
+   524→        socket.emit('error', { message: 'Room not found' })
+   525→        return
+   526→      }
+   527→
+   528→      const queueItem: QueueItem = {
+   529→        song,
+   530→        addedBy,
+   531→        addedAt: Date.now(),
+   532→      }
+   533→
+   534→      room.queue.push(queueItem)
+   535→
+   536→      // Broadcast updated queue to room
+   537→      io.to(roomId).emit('queue:update', {
+   538→        roomId,
+   539→        queue: room.queue,
+   540→        action: 'add',
+   541→        songId: song.id,
+   542→        addedBy,
+   543→      })
+   544→
+   545→      console.log(`[QUEUE:ADD] Room ${roomId} - Added "${song.title}" by ${song.artist}`)
+   546→    } catch (error) {
+   547→      console.error('[QUEUE:ADD] Error:', error)
+   548→      socket.emit('error', { message: 'Failed to add song to queue' })
+   549→    }
+   550→  })
+   551→
+   552→  socket.on('queue:remove', (data: { roomId: string; songId: string }) => {
+   553→    try {
+   554→      const { roomId, songId } = data
+   555→      const room = rooms.get(roomId)
+   556→      if (!room) {
+   557→        socket.emit('error', { message: 'Room not found' })
+   558→        return
+   559→      }
+   560→
+   561→      const index = room.queue.findIndex((item) => item.song.id === songId)
+   562→      if (index === -1) {
+   563→        socket.emit('error', { message: 'Song not found in queue' })
+   564→        return
+   565→      }
+   566→
+   567→      const removed = room.queue.splice(index, 1)[0]
+   568→
+   569→      io.to(roomId).emit('queue:update', {
+   570→        roomId,
+   571→        queue: room.queue,
+   572→        action: 'remove',
+   573→        songId,
+   574→      })
+   575→
+   576→      console.log(`[QUEUE:REMOVE] Room ${roomId} - Removed "${removed.song.title}"`)
+   577→    } catch (error) {
+   578→      console.error('[QUEUE:REMOVE] Error:', error)
+   579→      socket.emit('error', { message: 'Failed to remove song from queue' })
+   580→    }
+   581→  })
+   582→
+   583→  socket.on('queue:reorder', (data: { roomId: string; queue: QueueItem[] }) => {
+   584→    try {
+   585→      const { roomId, queue } = data
+   586→      const room = rooms.get(roomId)
+   587→      if (!room) {
+   588→        socket.emit('error', { message: 'Room not found' })
+   589→        return
+   590→      }
+   591→
+   592→      room.queue = queue
+   593→
+   594→      io.to(roomId).emit('queue:update', {
+   595→        roomId,
+   596→        queue: room.queue,
+   597→        action: 'reorder',
+   598→      })
+   599→
+   600→      console.log(`[QUEUE:REORDER] Room ${roomId} - Queue reordered (${queue.length} items)`)
+   601→    } catch (error) {
+   602→      console.error('[QUEUE:REORDER] Error:', error)
+   603→      socket.emit('error', { message: 'Failed to reorder queue' })
+   604→    }
+   605→  })
+   606→
+   607→  // ----------------------------------------------------------
+   608→  // WebRTC Signaling (for voice chat)
+   609→  // ----------------------------------------------------------
+   610→
+   611→  socket.on('webrtc:join-voice', (data: { roomId: string; userId: string }) => {
+   612→    try {
+   613→      const { roomId, userId } = data
+   614→      const room = rooms.get(roomId)
+   615→      if (!room) {
+   616→        socket.emit('error', { message: 'Room not found' })
+   617→        return
+   618→      }
+   619→
+   620→      room.voiceMembers.add(userId)
+   621→
+   622→      // Notify room that user joined voice
+   623→      io.to(roomId).emit('webrtc:user-joined-voice', {
+   624→        roomId,
+   625→        userId,
+   626→      })
+   627→
+   628→      // Send list of existing voice members to the joining user
+   629→      const existingVoiceMembers = Array.from(room.voiceMembers).filter((id) => id !== userId)
+   630→      socket.emit('webrtc:voice-members', {
+   631→        roomId,
+   632→        voiceMembers: existingVoiceMembers,
+   633→      })
+   634→
+   635→      console.log(`[WEBRTC:JOIN-VOICE] ${userId} joined voice in room ${roomId}. Voice members: ${room.voiceMembers.size}`)
+   636→    } catch (error) {
+   637→      console.error('[WEBRTC:JOIN-VOICE] Error:', error)
+   638→      socket.emit('error', { message: 'Failed to join voice chat' })
+   639→    }
+   640→  })
+   641→
+   642→  socket.on('webrtc:leave-voice', (data: { roomId: string; userId: string }) => {
+   643→    try {
+   644→      const { roomId, userId } = data
+   645→      const room = rooms.get(roomId)
+   646→      if (!room) {
+   647→        socket.emit('error', { message: 'Room not found' })
+   648→        return
+   649→      }
+   650→
+   651→      room.voiceMembers.delete(userId)
+   652→
+   653→      io.to(roomId).emit('webrtc:user-left-voice', {
+   654→        roomId,
+   655→        userId,
+   656→      })
+   657→
+   658→      console.log(`[WEBRTC:LEAVE-VOICE] ${userId} left voice in room ${roomId}. Voice members: ${room.voiceMembers.size}`)
+   659→    } catch (error) {
+   660→      console.error('[WEBRTC:LEAVE-VOICE] Error:', error)
+   661→      socket.emit('error', { message: 'Failed to leave voice chat' })
+   662→    }
+   663→  })
+   664→
+   665→  socket.on('webrtc:offer', (data: { roomId: string; targetUserId: string; offer: RTCSessionDescriptionInit }) => {
+   666→    try {
+   667→      const { roomId, targetUserId, offer } = data
+   668→      const room = rooms.get(roomId)
+   669→      if (!room) {
+   670→        socket.emit('error', { message: 'Room not found' })
+   671→        return
+   672→      }
+   673→
+   674→      const senderId = socketToUser.get(socket.id)
+   675→      if (!senderId) {
+   676→        socket.emit('error', { message: 'Not authenticated' })
+   677→        return
+   678→      }
+   679→
+   680→      // Find target user's socket
+   681→      const targetMember = room.members.get(targetUserId)
+   682→      if (!targetMember) {
+   683→        socket.emit('error', { message: 'Target user not found in room' })
+   684→        return
+   685→      }
+   686→
+   687→      io.to(targetMember.socketId).emit('webrtc:offer', {
+   688→        roomId,
+   689→        senderUserId: senderId,
+   690→        offer,
+   691→      })
+   692→
+   693→      console.log(`[WEBRTC:OFFER] ${senderId} -> ${targetUserId} in room ${roomId}`)
+   694→    } catch (error) {
+   695→      console.error('[WEBRTC:OFFER] Error:', error)
+   696→      socket.emit('error', { message: 'Failed to send WebRTC offer' })
+   697→    }
+   698→  })
+   699→
+   700→  socket.on('webrtc:answer', (data: { roomId: string; targetUserId: string; answer: RTCSessionDescriptionInit }) => {
+   701→    try {
+   702→      const { roomId, targetUserId, answer } = data
+   703→      const room = rooms.get(roomId)
+   704→      if (!room) {
+   705→        socket.emit('error', { message: 'Room not found' })
+   706→        return
+   707→      }
+   708→
+   709→      const senderId = socketToUser.get(socket.id)
+   710→      if (!senderId) {
+   711→        socket.emit('error', { message: 'Not authenticated' })
+   712→        return
+   713→      }
+   714→
+   715→      const targetMember = room.members.get(targetUserId)
+   716→      if (!targetMember) {
+   717→        socket.emit('error', { message: 'Target user not found in room' })
+   718→        return
+   719→      }
+   720→
+   721→      io.to(targetMember.socketId).emit('webrtc:answer', {
+   722→        roomId,
+   723→        senderUserId: senderId,
+   724→        answer,
+   725→      })
+   726→
+   727→      console.log(`[WEBRTC:ANSWER] ${senderId} -> ${targetUserId} in room ${roomId}`)
+   728→    } catch (error) {
+   729→      console.error('[WEBRTC:ANSWER] Error:', error)
+   730→      socket.emit('error', { message: 'Failed to send WebRTC answer' })
+   731→    }
+   732→  })
+   733→
+   734→  socket.on('webrtc:ice-candidate', (data: { roomId: string; targetUserId: string; candidate: RTCIceCandidateInit }) => {
+   735→    try {
+   736→      const { roomId, targetUserId, candidate } = data
+   737→      const room = rooms.get(roomId)
+   738→      if (!room) {
+   739→        socket.emit('error', { message: 'Room not found' })
+   740→        return
+   741→      }
+   742→
+   743→      const senderId = socketToUser.get(socket.id)
+   744→      if (!senderId) {
+   745→        socket.emit('error', { message: 'Not authenticated' })
+   746→        return
+   747→      }
+   748→
+   749→      const targetMember = room.members.get(targetUserId)
+   750→      if (!targetMember) {
+   751→        // Target might have disconnected, silently ignore
+   752→        return
+   753→      }
+   754→
+   755→      io.to(targetMember.socketId).emit('webrtc:ice-candidate', {
+   756→        roomId,
+   757→        senderUserId: senderId,
+   758→        candidate,
+   759→      })
+   760→
+   761→      // Don't log ICE candidates (too noisy)
+   762→    } catch (error) {
+   763→      console.error('[WEBRTC:ICE-CANDIDATE] Error:', error)
+   764→      socket.emit('error', { message: 'Failed to send ICE candidate' })
+   765→    }
+   766→  })
+   767→
+   768→  // ----------------------------------------------------------
+   769→  // User Presence & Utility
+   770→  // ----------------------------------------------------------
+   771→
+   772→  socket.on('user:mute', (data: { roomId: string; userId: string; isMuted: boolean }) => {
+   773→    try {
+   774→      const { roomId, userId, isMuted } = data
+   775→      const room = rooms.get(roomId)
+   776→      if (!room) return
+   777→
+   778→      const member = room.members.get(userId)
+   779→      if (member) {
+   780→        member.isMuted = isMuted
+   781→        io.to(roomId).emit('user:mute-update', { roomId, userId, isMuted })
+   782→      }
+   783→    } catch (error) {
+   784→      console.error('[USER:MUTE] Error:', error)
+   785→    }
+   786→  })
+   787→
+   788→  socket.on('room:get-state', (data: { roomId: string }) => {
+   789→    try {
+   790→      const { roomId } = data
+   791→      const room = rooms.get(roomId)
+   792→      if (!room) {
+   793→        socket.emit('error', { message: 'Room not found' })
+   794→        return
+   795→      }
+   796→
+   797→      socket.emit('room:state', {
+   798→        room: serializeRoom(room),
+   799→        currentPosition: calculateCurrentPosition(room),
+   800→      })
+   801→    } catch (error) {
+   802→      console.error('[ROOM:GET-STATE] Error:', error)
+   803→      socket.emit('error', { message: 'Failed to get room state' })
+   804→    }
+   805→  })
+   806→
+   807→  socket.on('room:list', () => {
+   808→    try {
+   809→      const roomList = Array.from(rooms.values()).map((room) => ({
+   810→        id: room.id,
+   811→        name: room.name,
+   812→        memberCount: room.members.size,
+   813→        hostId: room.hostId,
+   814→        isPlaying: room.playback.isPlaying,
+   815→        currentSong: room.playback.currentSong?.title ?? null,
+   816→      }))
+   817→      socket.emit('room:list', { rooms: roomList })
+   818→    } catch (error) {
+   819→      console.error('[ROOM:LIST] Error:', error)
+   820→      socket.emit('error', { message: 'Failed to list rooms' })
+   821→    }
+   822→  })
+   823→
+   824→  // ----------------------------------------------------------
+   825→  // Chat Messages (bonus feature)
+   826→  // ----------------------------------------------------------
+   827→
+   828→  socket.on('chat:message', (data: { roomId: string; userId: string; userName: string; message: string }) => {
+   829→    try {
+   830→      const { roomId, userId, userName, message } = data
+   831→      const room = rooms.get(roomId)
+   832→      if (!room) {
+   833→        socket.emit('error', { message: 'Room not found' })
+   834→        return
+   835→      }
+   836→
+   837→      const chatMessage = {
+   838→        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+   839→        userId,
+   840→        userName,
+   841→        message,
+   842→        timestamp: Date.now(),
+   843→      }
+   844→
+   845→      io.to(roomId).emit('chat:message', chatMessage)
+   846→    } catch (error) {
+   847→      console.error('[CHAT:MESSAGE] Error:', error)
+   848→      socket.emit('error', { message: 'Failed to send message' })
+   849→    }
+   850→  })
+   851→
+   852→  // ----------------------------------------------------------
+   853→  // Disconnect & Reconnection
+   854→  // ----------------------------------------------------------
+   855→
+   856→  socket.on('disconnect', (reason) => {
+   857→    try {
+   858→      const leaveInfo = removeMemberFromRoom(socket)
+   859→      if (leaveInfo) {
+   860→        const { roomId, userId, userName } = leaveInfo
+   861→        socket.leave(roomId)
+   862→
+   863→        io.to(roomId).emit('room:member-left', {
+   864→          roomId,
+   865→          userId,
+   866→          userName,
+   867→          reason,
+   868→        })
+   869→
+   870→        const room = rooms.get(roomId)
+   871→        if (room) {
+   872→          io.to(roomId).emit('room:update', serializeRoom(room))
+   873→        }
+   874→
+   875→        console.log(`[DISCONNECT] ${userName} (${userId}) disconnected from room ${roomId}. Reason: ${reason}`)
+   876→      } else {
+   877→        console.log(`[DISCONNECT] Socket ${socket.id} disconnected. Reason: ${reason}`)
+   878→      }
+   879→    } catch (error) {
+   880→      console.error('[DISCONNECT] Error:', error)
+   881→    }
+   882→  })
+   883→
+   884→  socket.on('error', (error) => {
+   885→    console.error(`[SOCKET ERROR] Socket ${socket.id}:`, error)
+   886→  })
+   887→})
+   888→
+   889→// ============================================================
+   890→// Periodic Cleanup (every 5 minutes)
+   891→// ============================================================
+   892→
+   893→setInterval(() => {
+   894→  const now = Date.now()
+   895→  for (const [roomId, room] of rooms.entries()) {
+   896→    // Remove stale members (no activity for 10 minutes)
+   897→    for (const [userId, member] of room.members.entries()) {
+   898→      const socketExists = io.sockets.sockets.has(member.socketId)
+   899→      if (!socketExists && now - member.joinedAt > 10 * 60 * 1000) {
+   900→        room.members.delete(userId)
+   901→        room.voiceMembers.delete(userId)
+   902→        console.log(`[CLEANUP] Removed stale member ${userId} from room ${roomId}`)
+   903→      }
+   904→    }
+   905→
+   906→    // Delete empty rooms
+   907→    if (room.members.size === 0) {
+   908→      rooms.delete(roomId)
+   909→      console.log(`[CLEANUP] Deleted empty room ${roomId}`)
+   910→    }
+   911→  }
+   912→}, 5 * 60 * 1000)
+   913→
+   914→// ============================================================
+   915→// Start Server
+   916→// ============================================================
+   917→
+   918→const PORT = 3003
+   919→
+   920→httpServer.listen(PORT, () => {
+   921→  console.log(`
+   922→╔══════════════════════════════════════════════╗
+   923→║   🎵 Syncora Sync Service                    ║
+   924→║   Socket.io server running on port ${PORT}       ║
+   925→║   Path: /                                    ║
+   926→║   CORS: *                                    ║
+   927→╚══════════════════════════════════════════════╝
+   928→  `)
+   929→})
+   930→
+   931→// ============================================================
+   932→// Graceful Shutdown
+   933→// ============================================================
+   934→
+   935→const gracefulShutdown = () => {
+   936→  console.log('\n[SHUTDOWN] Graceful shutdown initiated...')
+   937→
+   938→  // Notify all connected clients
+   939→  io.emit('server:shutdown', {
+   940→    message: 'Server is shutting down',
+   941→    timestamp: Date.now(),
+   942→  })
+   943→
+   944→  io.disconnectSockets(true)
+   945→
+   946→  httpServer.close(() => {
+   947→    console.log('[SHUTDOWN] HTTP server closed')
+   948→    process.exit(0)
+   949→  })
+   950→
+   951→  // Force shutdown after 10 seconds
+   952→  setTimeout(() => {
+   953→    console.error('[SHUTDOWN] Forced shutdown after timeout')
+   954→    process.exit(1)
+   955→  }, 10000)
+   956→}
+   957→
+   958→process.on('SIGTERM', gracefulShutdown)
+   959→process.on('SIGINT', gracefulShutdown)
+   960→
