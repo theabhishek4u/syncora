@@ -31,7 +31,6 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
 
 # vercel
 .vercel
@@ -52,3 +51,25 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Database
+db/*.db
+
+# Screenshots
+screenshot-*.png
+
+# Tool results
+/tool-results/
+
+# Agent context
+/agent-ctx/
+
+# Download folder
+/download/
+
+# Examples
+/examples/
+
+# Z scripts
+.zscripts/
+config.bat
